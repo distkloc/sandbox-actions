@@ -1,0 +1,98 @@
+name: "ci"
+
+on:
+  pull_request:
+    types: [synchronize, opened]
+    paths:
+      - "**.py"
+
+jobs:
+  set-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      git-diff: $${{ steps.git-diff.outputs.diff }}
+      projects: ${{ steps.find-projects.outputs.projects }}
+    steps:
+      - uses: technote-space/get-diff-action@c747e3f4e5fe6ab4870031a8e33721e61914140c
+        id: git-diff
+        with:
+          PATTERNS: |
+            apps/**/*.py
+          FORMAT: json
+      - name: Find python project directories
+        id: find-projects
+        run: >
+          projects=$(echo '{{ env.GIT_DIFF_FILTERED }}'
+          | jq -c '[.[]
+          | capture("(?<project_root>apps/.*?/app/|apps/.*?/batch/.*?/)(?<diff_path>.*)"; "ig") ]
+          | group_by(.project_root)
+          | map({ "project_root": .[0].project_root, "diff_paths": [.[].diff_path] })')
+
+          echo "::set-output name=projects::${projects}"
+        if: env.GIT_DIFF
+
+  execute-matrix:
+    needs: set-matrix
+    if: needs.set-matrix.outputs.git-diff
+    runs-on: ubuntu-latest
+    env:
+      PYTHON_VERSION: 3.9
+      POETRY_VERSION: 1.1.14
+      DIFF_FILES: ${{ needs.set-matrix.outputs.projects.diff_paths | jq -r '. | join(" ")' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJson(needs.set-matrix.outputs.projects) }}
+    steps:
+      - run: echo ${{ matrix.project }}
+        
+      - uses: actions/checkout@v3
+
+      - name: Cache Poetry cache
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-cache-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ env.POETRY_VERSION }}
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'poetry'
+
+      - name: Install Poetry
+        run: |
+          curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install Dependencies
+        run: |
+          poetry env use ${{ env.PYTHON_VERSION }}
+          poetry install
+        working-directory: ${{ matrix.project.project_root }}
+
+      - name: flake8
+        if: always()
+        run: poetry run flake8 ${{ env.DIFF_FILES }}
+        working-directory: ${{ matrix.project.project_root }}
+
+      - name: black
+        if: always()
+        run: poetry run black --check --diff ${{ env.DIFF_FILES }}
+        working-directory: ${{ matrix.project.project_root }}
+
+      - name: isort
+        if: always()
+        run: poetry run isort --check --diff ${{ env.DIFF_FILES }}
+        working-directory: ${{ matrix.project.project_root }}
+
+      - name: mypy
+        if: always()
+        run: poetry run mypy ${{ env.DIFF_FILES }}
+        working-directory: ${{ matrix.project.project_root }}
+
+      - name: pytest
+        if: always()
+        run: poetry run pytest .
+        working-directory: ${{ matrix.project.project_root }}
